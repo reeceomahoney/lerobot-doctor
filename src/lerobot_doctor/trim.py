@@ -149,11 +149,13 @@ def trim_dataset(
 
                 rows_to_keep.extend(trimmed_indices)
 
-            # Write trimmed table
+            # Write trimmed table. Per-row `frame_index` and `timestamp` are
+            # left at their original values so video frame seek (which uses
+            # episode `from_timestamp` + per-row `timestamp`) still resolves
+            # to the correct frame in the unmodified video files. The global
+            # `index` column is rebuilt in `_update_metadata_after_trim`.
             if len(rows_to_keep) < len(ep_col) and not dry_run:
                 trimmed_table = table.take(rows_to_keep)
-                # Reindex frames within each episode
-                trimmed_table = _reindex_frames(trimmed_table)
                 pq.write_table(trimmed_table, pf)
 
         except Exception as e:
@@ -166,34 +168,85 @@ def trim_dataset(
     return result
 
 
-def _reindex_frames(table: pa.Table) -> pa.Table:
-    """Rebuild frame_index to be 0-based per episode."""
-    if "frame_index" not in table.column_names:
-        return table
-
-    ep_col = table.column("episode_index").to_pylist()
-    new_frames = []
-    current_ep = None
-    counter = 0
-
-    for ep in ep_col:
-        if ep != current_ep:
-            current_ep = ep
-            counter = 0
-        new_frames.append(counter)
-        counter += 1
-
-    return table.set_column(
-        table.column_names.index("frame_index"),
-        "frame_index",
-        pa.array(new_frames)
-    )
-
-
 def _update_metadata_after_trim(root: Path):
-    """Update info.json and episodes metadata after trimming."""
-    from .fix import _fix_metadata, _fix_episode_metadata, _fix_timestamps, FixResult
-    result = FixResult(fixed=[], skipped=[], errors=[])
-    _fix_metadata(root, result, dry_run=False)
-    _fix_timestamps(root, result, dry_run=False)
-    _fix_episode_metadata(root, result, dry_run=False)
+    """Update info.json, the data `index` column, and episodes metadata after
+    trimming.
+
+    Preserves per-row `timestamp` and `frame_index`, and per-episode video
+    `from_timestamp`/`to_timestamp` — the video files themselves are not
+    modified, so the original timestamps remain the correct seek keys.
+
+    Rebuilds:
+      - data `index` column (contiguous 0..N across kept rows)
+      - episodes `length`, `dataset_from_index`, `dataset_to_index`
+      - info.json `total_frames`, `total_episodes`
+
+    Episodes that were entirely removed (fully-static) are dropped from
+    the episodes metadata.
+    """
+    data_dir = root / "data"
+    if not data_dir.exists():
+        return
+
+    parquet_files = sorted(data_dir.rglob("*.parquet"))
+
+    # Pass 1: rebuild contiguous global `index`; record per-episode row range.
+    global_idx = 0
+    episode_bounds: dict[int, tuple[int, int]] = {}
+    for pf in parquet_files:
+        table = pq.read_table(pf)
+        ep_col = table.column("episode_index").to_pylist()
+        n = len(ep_col)
+        if n == 0:
+            continue
+        new_index = list(range(global_idx, global_idx + n))
+        for offset, ep in enumerate(ep_col):
+            row = global_idx + offset
+            if ep not in episode_bounds:
+                episode_bounds[ep] = (row, row + 1)
+            else:
+                episode_bounds[ep] = (episode_bounds[ep][0], row + 1)
+        global_idx += n
+        if "index" in table.column_names:
+            table = table.set_column(
+                table.column_names.index("index"),
+                "index",
+                pa.array(new_index),
+            )
+            pq.write_table(table, pf)
+
+    # Pass 2: update episodes metadata in place, preserving all other columns.
+    episodes_dir = root / "meta" / "episodes"
+    if episodes_dir.exists():
+        for mf in sorted(episodes_dir.rglob("*.parquet")):
+            meta_table = pq.read_table(mf)
+            if "episode_index" not in meta_table.column_names:
+                continue
+            ep_col = meta_table.column("episode_index").to_pylist()
+            keep_mask = [ep in episode_bounds for ep in ep_col]
+            if not any(keep_mask):
+                mf.unlink()
+                continue
+            meta_table = meta_table.filter(pa.array(keep_mask))
+            ep_col = meta_table.column("episode_index").to_pylist()
+
+            updates = {
+                "dataset_from_index": [episode_bounds[ep][0] for ep in ep_col],
+                "dataset_to_index": [episode_bounds[ep][1] for ep in ep_col],
+                "length": [episode_bounds[ep][1] - episode_bounds[ep][0] for ep in ep_col],
+            }
+            for col, vals in updates.items():
+                if col in meta_table.column_names:
+                    meta_table = meta_table.set_column(
+                        meta_table.column_names.index(col), col, pa.array(vals)
+                    )
+            pq.write_table(meta_table, mf)
+
+    # Pass 3: info.json totals.
+    info_path = root / "meta" / "info.json"
+    if info_path.exists():
+        import json as _json
+        info = _json.loads(info_path.read_text())
+        info["total_frames"] = global_idx
+        info["total_episodes"] = len(episode_bounds)
+        info_path.write_text(_json.dumps(info, indent=2))
