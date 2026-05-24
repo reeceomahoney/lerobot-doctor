@@ -40,7 +40,9 @@ def main(argv: list[str] | None = None):
 
     # === TRIM ===
     trim_p = subparsers.add_parser("trim", help="Remove idle/static frames from episodes")
-    trim_p.add_argument("dataset", help="Path to local dataset")
+    trim_p.add_argument("dataset", help="Path to local dataset, or HF repo_id (downloaded to --out)")
+    trim_p.add_argument("--out", type=str, default=None,
+                        help="Output dir when dataset is an HF repo_id. Default: ./<repo_short_name>")
     trim_p.add_argument("--threshold", type=float, default=0.01)
     trim_p.add_argument("--min-active", type=int, default=10)
     trim_p.add_argument("--min-frozen-run", type=int, default=5,
@@ -155,8 +157,26 @@ def _run_trim(args):
     from pathlib import Path
     from lerobot_doctor.trim import trim_dataset
 
+    root = Path(args.dataset)
+    if not root.exists() and "/" in args.dataset and not args.dataset.startswith("."):
+        # Treat as HF repo_id: materialize a fresh working copy (NOT the HF
+        # cache, whose files are symlinks into the blob store and unsafe to
+        # edit in place).
+        from huggingface_hub import snapshot_download
+        out = Path(args.out) if args.out else Path(args.dataset.split("/")[-1])
+        print(f"Downloading {args.dataset} → {out}", file=sys.stderr)
+        snapshot_download(
+            repo_id=args.dataset, repo_type="dataset",
+            local_dir=str(out), allow_patterns=["meta/**", "data/**", "videos/**"],
+        )
+        root = out
+
+    if not (root / "data").exists():
+        print(f"Error: {root}/data not found — not a LeRobot v3 dataset root", file=sys.stderr)
+        sys.exit(1)
+
     result = trim_dataset(
-        Path(args.dataset), action_threshold=args.threshold,
+        root, action_threshold=args.threshold,
         min_active_frames=args.min_active,
         trim_start=not args.no_trim_start, trim_end=not args.no_trim_end,
         min_frozen_run=args.min_frozen_run,
