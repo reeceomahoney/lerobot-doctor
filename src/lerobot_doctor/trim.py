@@ -78,21 +78,25 @@ def trim_dataset(
             for ep_idx in sorted(episodes.keys()):
                 row_indices = episodes[ep_idx]
 
-                # Get action values for this episode
+                # Get action values for this episode. Handles both scalar columns
+                # (action.x, action.y, ...) and a single vector column where each
+                # row is a list (the v3 default `action` column).
                 actions = []
                 for col in action_cols:
                     try:
                         vals = np.array([table.column(col)[i].as_py() for i in row_indices], dtype=np.float64)
-                        if vals.ndim == 1:
-                            actions.append(vals)
                     except (ValueError, TypeError):
                         continue
+                    if vals.ndim == 1:
+                        actions.append(vals.reshape(-1, 1))
+                    elif vals.ndim == 2:
+                        actions.append(vals)
 
                 if not actions:
                     rows_to_keep.extend(row_indices)
                     continue
 
-                action_matrix = np.column_stack(actions) if len(actions) > 1 else actions[0].reshape(-1, 1)
+                action_matrix = np.concatenate(actions, axis=1)
 
                 # Compute per-frame "activity" as action change magnitude
                 if len(action_matrix) < 2:
