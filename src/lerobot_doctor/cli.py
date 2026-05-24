@@ -43,6 +43,11 @@ def main(argv: list[str] | None = None):
     trim_p.add_argument("dataset", help="Path to local dataset")
     trim_p.add_argument("--threshold", type=float, default=0.01)
     trim_p.add_argument("--min-active", type=int, default=10)
+    trim_p.add_argument("--min-frozen-run", type=int, default=5,
+                        help="Drop internal runs of idle frames whose length is >= this. "
+                             "Set to 0 to only trim start/end. Default: 5 (~250ms at 20fps).")
+    trim_p.add_argument("--no-trim-start", action="store_true")
+    trim_p.add_argument("--no-trim-end", action="store_true")
     trim_p.add_argument("--keep-static", action="store_true")
     trim_p.add_argument("--dry-run", action="store_true")
 
@@ -152,7 +157,10 @@ def _run_trim(args):
 
     result = trim_dataset(
         Path(args.dataset), action_threshold=args.threshold,
-        min_active_frames=args.min_active, remove_fully_static=not args.keep_static,
+        min_active_frames=args.min_active,
+        trim_start=not args.no_trim_start, trim_end=not args.no_trim_end,
+        min_frozen_run=args.min_frozen_run,
+        remove_fully_static=not args.keep_static,
         dry_run=args.dry_run,
     )
     prefix = "[DRY RUN] " if args.dry_run else ""

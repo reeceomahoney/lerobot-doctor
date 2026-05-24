@@ -1,8 +1,9 @@
 """Episode trimming — remove idle/static frames from episodes.
 
 Detects and removes frames where the robot isn't moving (common at
-the start/end of teleoperation recordings). These idle frames teach
-the policy to "do nothing" which causes stuck behaviors at inference.
+the start/end of teleoperation recordings, and as internal stalls
+where the operator hesitates). These idle frames teach the policy to
+"do nothing" which causes stuck behaviors at inference.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ def trim_dataset(
     min_active_frames: int = 10,
     trim_start: bool = True,
     trim_end: bool = True,
+    min_frozen_run: int = 5,
     remove_fully_static: bool = True,
     dry_run: bool = False,
 ) -> TrimResult:
@@ -41,6 +43,8 @@ def trim_dataset(
         min_active_frames: Minimum active frames to keep an episode
         trim_start: Remove idle frames at start of episodes
         trim_end: Remove idle frames at end of episodes
+        min_frozen_run: Also drop internal runs of idle frames whose length
+            is >= this value. Set to 0 to only trim start/end.
         remove_fully_static: Remove episodes that are entirely static
         dry_run: Only report, don't modify
     """
@@ -116,6 +120,19 @@ def trim_dataset(
                 end = active_indices[-1] + 1 if trim_end else len(row_indices)
 
                 trimmed_indices = row_indices[start:end]
+
+                # Drop internal runs of idle frames whose length is >= min_frozen_run
+                if min_frozen_run > 0 and len(trimmed_indices) > 0:
+                    idle = (~is_active[start:end]).astype(np.int8)
+                    edges = np.diff(np.concatenate([[0], idle, [0]]))
+                    run_starts = np.where(edges == 1)[0]
+                    run_ends = np.where(edges == -1)[0]
+                    keep = np.ones(len(trimmed_indices), dtype=bool)
+                    for s, e in zip(run_starts, run_ends):
+                        if e - s >= min_frozen_run:
+                            keep[s:e] = False
+                    trimmed_indices = [trimmed_indices[i] for i in np.where(keep)[0]]
+
                 n_removed = len(row_indices) - len(trimmed_indices)
 
                 if n_removed > 0:
@@ -171,7 +188,8 @@ def _reindex_frames(table: pa.Table) -> pa.Table:
 
 def _update_metadata_after_trim(root: Path):
     """Update info.json and episodes metadata after trimming."""
-    from .fix import _fix_metadata, _fix_episode_metadata, FixResult
+    from .fix import _fix_metadata, _fix_episode_metadata, _fix_timestamps, FixResult
     result = FixResult(fixed=[], skipped=[], errors=[])
     _fix_metadata(root, result, dry_run=False)
+    _fix_timestamps(root, result, dry_run=False)
     _fix_episode_metadata(root, result, dry_run=False)
